@@ -1,0 +1,69 @@
+{
+  "Comment": "A Payment Processor Integration",
+  "StartAt": "Purchase",
+  "States": {
+    "Purchase": {
+      "Type": "Task",
+      "Resource": "${PurchaseFunctionArn}",
+      "Parameters": {
+        "transactionReference.$": "$.TransactionReference",
+        "registerId.$": "$.RegisterId",
+        "amount.$": "$.Amount"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Push Status"
+    },
+    "Push Status": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "ResultPath": null,
+      "Parameters": {
+        "TopicArn": "${TransactionStatusTopicArn}",
+        "Message.$": "$"
+      },
+      "Next": "Check Transaction Status"
+    },
+    "Check Transaction Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.done",
+          "BooleanEquals": false,
+          "Next": "Pull Status"
+        }
+      ],
+      "Default": "Success"
+    },
+    "Pull Status": {
+      "Type": "Task",
+      "Resource": "${StatusFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Push Status"
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

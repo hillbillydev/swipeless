@@ -1,0 +1,24 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "Swipeless"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-474qfoltx313"
+s3_prefix = "swipeless"
+region = "ap-southeast-2"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Stage=\"v1\" Environment=\"dev\" AllowedOrigin=\"http://localhost:8080\""
+tags = "project=\"swipeless\" team=\"payments\""
+profile = "cloudformation"
+
+[default.build]
+[default.build.parameters]
+use_container=true
+cached=true
+parallel=true
+
+[default.local_invoke]
+[default.local_invoke.parameters]
+env_vars="locals.json"
+warm_containers="EAGER"

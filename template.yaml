@@ -1,0 +1,1021 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Swipeless swipes less cards then any cowboy around.
+
+Globals:
+  Api:
+    TracingEnabled: true
+    OpenApiVersion: '3.0.3'
+    Cors:
+      AllowMethods: "'OPTIONS,POST,GET,PUT'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowCredentials: true
+      AllowOrigin: !Sub "'${AllowedOrigin}'"
+  Function:
+    Runtime: python3.8
+    Timeout: 25
+    Tracing: Active
+    MemorySize: 512
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: payment
+        POWERTOOLS_METRICS_NAMESPACE: serverless-swipeless
+        POWERTOOLS_LOGGER_SAMPLE_RATE: 0.1
+        LOG_LEVEL: INFO
+        ENVIRONMENT: !Ref Environment
+
+Parameters:
+  Stage:
+    Type: String
+    Description: Stage Name
+    Default: "v1"
+  AllowedOrigin:
+    Type: 'String'
+  Environment:
+    Type: String
+    Description: Which environment is this stack running in?
+    ConstraintDescription: "must specify prod, dev or stage."
+    AllowedValues:
+      - "prod"
+      - "dev"
+      - "stage"
+    Default: "dev"
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    Description: "CloudWatch Logs retention period"
+
+Conditions:
+  IsEnvProd:  !Equals [!Ref "Environment", "prod"]
+  IsEnvStage: !Equals [!Ref "Environment", "stage"]
+  isEnvDev: !Equals [!Ref "Environment", "dev"]
+
+Resources:
+
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./layers/
+      CompatibleRuntimes:
+        - python3.8
+    Metadata:
+      BuildMethod: python3.8
+##########################################################################
+# DynamoDB                                                               #
+##########################################################################
+
+  ConnectionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: "transactionReference"
+        AttributeType: "S"
+      KeySchema:
+      - AttributeName: "transactionReference"
+        KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: True
+
+  SwipelessTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: "PK"
+        AttributeType: "S"
+      - AttributeName: "SK"
+        AttributeType: "S"
+      KeySchema:
+      - AttributeName: "PK"
+        KeyType: "HASH"
+      - AttributeName: "SK"
+        KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: True
+
+  PaymentIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -   AttributeName: "id"
+            AttributeType: S
+      KeySchema:
+        -   AttributeName: "id"
+            KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+      BillingMode: PAY_PER_REQUEST
+
+##########################################################################
+# Lambda                                                                 #
+##########################################################################
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/windcave/
+      Layers:
+        - !Ref SharedLayer
+      Handler: status.lambda_handler
+      Environment:
+        Variables:
+          WINDCAVE_URL: !GetAtt WindcaveEndpointParameter.Value
+
+  OnTerminalEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/websocket/
+      Handler: terminal_event.lambda_handler
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          CONNECTION_TABLE: !Ref ConnectionTable
+          PAYMENT_WEBSOCKET_API_URL: !GetAtt PaymentWebsocketApi.ApiEndpoint
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionTable
+        - SNSCrudPolicy:
+            TopicName: !GetAtt  TransactionStatusTopic.TopicName
+        - Statement:
+          - Effect: Allow
+            Action:
+              - 'execute-api:ManageConnections'
+            Resource:
+              - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PaymentWebsocketApi}/*'
+      Events:
+        SNS1:
+          Type: SNS
+          Properties:
+            Topic: !Ref TransactionStatusTopic
+
+  OnConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/websocket/
+      Handler: connect.lambda_handler
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          CONNECTION_TABLE: !Ref ConnectionTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionTable
+
+  OnDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/websocket/
+      Layers:
+        - !Ref SharedLayer
+      Handler: disconnect.lambda_handler
+
+  PurchaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/windcave/
+      Layers:
+        - !Ref SharedLayer
+      Handler: purchase.lambda_handler
+      Environment:
+        Variables:
+          WINDCAVE_URL: !GetAtt WindcaveEndpointParameter.Value
+
+  CreatePairingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/pairing/
+      Handler: create_pairing.lambda_handler
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          SWIPELESS_TABLE: !Ref SwipelessTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionTable
+
+
+##########################################################################
+# SNS                                                                    #
+##########################################################################
+
+  TransactionStatusTopic:
+    Type: AWS::SNS::Topic
+
+##########################################################################
+# Step Functions                                                         #
+##########################################################################
+
+  ProcessPaymentStateMachine:
+      Type: AWS::Serverless::StateMachine
+      Properties:
+        Name: !Sub ProcessWindcavePayment-${Environment}
+        Role: !Sub ${ProcessPaymentStateMachineRole.Arn}
+        DefinitionUri: statemachines/payment.asl.json
+        Tracing:
+          Enabled: true
+        DefinitionSubstitutions:
+          PurchaseFunctionArn: !GetAtt PurchaseFunction.Arn
+          StatusFunctionArn: !GetAtt StatusFunction.Arn
+          TransactionStatusTopicArn: !Ref TransactionStatusTopic
+
+##########################################################################
+#   Websocket Gateway                                                    #
+##########################################################################
+
+  PaymentWebsocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: PaymentWebsocketApi
+      Description: "Looking for events from your payments? Look no further."
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+      
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectIntegration
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFunction.Arn}/invocations
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref DisconnectInteg
+
+  DisconnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectFunction.Arn}/invocations
+
+  SendRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+      RouteKey: sendmessage
+      AuthorizationType: NONE
+      OperationName: SendRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref SendInteg
+
+  SendInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+      Description: Send Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnTerminalEventFunction.Arn}/invocations
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+    - ConnectRoute
+    - SendRoute
+    - DisconnectRoute
+    Properties:
+      ApiId: !Ref PaymentWebsocketApi
+
+  WebsocketApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: "v1"
+      Description: "First version Stage"
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref PaymentWebsocketApi
+
+  OnConnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - PaymentWebsocketApi
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  OnDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - PaymentWebsocketApi
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnDisconnectFunction
+      Principal: apigateway.amazonaws.com
+
+##########################################################################
+#   HTTP Gateway                                                         #
+##########################################################################
+
+  PaymentsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub Swipeless-${Stage}
+      Description: "This is where payments swipe less then before."
+      StageName: "v1"
+      # Auth:
+      #   DefaultAuthorizer: CognitoAuthorizer
+      #   Authorizers:
+      #     CognitoAuthorizer:
+      #       UserPoolArn: !GetAtt UserPool.Arn
+      AccessLogSetting:
+        DestinationArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${PaymentsApiLogGroup}"
+        Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user","requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath", "status":"$context.status","protocol":"$context.protocol", "responseLength":"$context.responseLength", "error": "$context.error.message", "user_arn": "$context.identity.userArn"}'
+      MethodSettings:
+        - MetricsEnabled: True
+          ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+      DefinitionBody:
+        openapi: "3.0.3"
+        info:
+            title: "Swipeless"
+            description: "A place where duke does not screw us over"
+            version: 1.0
+            contact:
+              name: API Support
+              url: http://www.example.com/support
+              email: support@example.com
+            license:
+              name: Apache 2.0
+              url: https://www.apache.org/licenses/LICENSE-2.0.html
+        x-amazon-apigateway-request-validator: all
+        x-amazon-apigateway-request-validators:
+          all:
+            validateRequestBody: true
+            validateRequestParameters: true
+        paths:
+          "/register/{registerId}/transaction":
+            post:
+              summary: "Make a purchase or refund with Windcave"
+              produces:
+                - application/json
+              responses:
+                '200':
+                  $ref: '#/components/responses/PendingTransaction'
+                '403':
+                  $ref: '#/components/responses/Error'
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      title: CreateTransaction
+                      description: "Create a transaction."
+                      type: object
+                      properties:
+                        money:
+                          $ref: '#/components/schemas/Money'
+                        transactionReference:
+                          type: string
+                          format: uuid
+                      required:
+                        - money
+                        - transactionReference
+              parameters:
+                - name: "registerId"
+                  in: "path"
+                  required: true
+                  schema:
+                    type: "string"
+                    format: "uuid"
+                  description: >
+                    The id of the register that you have paired with Windcave.
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials:
+                  Fn::GetAtt: [ PaymentApiGatewayRole, Arn ]
+                passthroughBehavior: when_no_match
+                uri:
+                  Fn::Sub: arn:aws:apigateway:${AWS::Region}:states:action/StartExecution
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($data = $input.path('$'))
+                    #set($registerId = $input.params('registerId'))
+                    {
+                      "name": "$data.transactionReference",
+                      "stateMachineArn": "${ProcessPaymentStateMachine}",
+                      "input": "{\"Type\":\"PURCHASE\",\"RegisterId\":\"$registerId\",\"TransactionReference\":\"$data.transactionReference\",\"Amount\":\"$data.money.amount\"}"
+                    }
+                responses:
+                  default:
+                    statusCode: 200
+                    responseTemplates:
+                      application/json: !Sub |
+                        #set($root = $input.path('$'))
+                        #set($message = $root.message)
+                        {
+                          ## When the caller uses the same transaction reference, stepfunction will tell us this and we want to extract the executionArn from that message.
+                          #if($message != "")
+                            "executionArn": "$message.replaceAll("^.*'(.*?)'.*$", "$1")"
+                          #else
+                            "executionArn": "$root.executionArn"
+                          #end
+                        }
+                  ".*CREATION_FAILED.*":
+                    statusCode: 403
+                    responseTemplates:
+                      application/json: $input.path('$.errorMessage')
+          "/pairing":
+            post:
+              summary: "Create a Windcave pairing to a terminal"
+              produces:
+                - application/json
+              responses:
+                '200':
+                  $ref: '#/components/responses/CreatedPairing'
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      title: CreatePairing
+                      description: "Create a pairing to windcave."
+                      type: object
+                      properties:
+                        username:
+                          type: string
+                          minLength: 1
+                        apiKey:
+                          type: string
+                          minLength: 1
+                        stationId:
+                          type: integer
+                      required:
+                        - username
+                        - apiKey
+                        - stationId
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials:
+                  Fn::GetAtt: [ PaymentApiGatewayRole, Arn ]
+                passthroughBehavior: when_no_match
+                uri:
+                  !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreatePairingFunction.Arn}/invocations
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($data = $input.path('$'))
+                    {
+                      "stationId": "$data.stationId",
+                      "username": "$data.username",
+                      "apiKey": "$data.apiKey"
+                    }
+
+        components:
+          schemas:
+            Money:
+              type: object
+              properties:
+                amount:
+                  type: number
+                  format: decimal
+                  description: Amount expressed as a decimal number of major currency units
+                  multipleOf: 0.01
+                  exclusiveMinimum: true
+                  minimum: 0
+                  example: 99.95
+                currency:
+                  type: string
+                  format: iso-4217
+                  description: 3 letter currency code as defined by ISO-4217
+                  minLength: 3
+                  maxLength: 3
+                  example: "EUR"
+              required:
+                - amount
+                - currency
+            Error:
+              title: Error
+              type: object
+              properties:
+                code:
+                  type: string
+                message:
+                  type: string
+          responses:
+            200Empty:
+              description: "Default OK response"
+            CreatedPairing:
+              content:
+                application/json:
+                  schema:
+                    title: CreatedPairing
+                    description: "The created pairing"
+                    type: object
+                    properties:
+                      id:
+                        type: uuid
+            PendingTransaction:
+              content:
+                application/json:
+                  schema:
+                    title: PendingTransaction
+                    description: "This is a transaction that is in a pending state."
+                    type: object
+                    properties:
+                      executionArn:
+                        type: string
+            Error:
+              description: Error Response
+              content:
+                application/json:
+                  schema:
+                    $ref: '#/components/schemas/Error'
+
+  ApiGatewayCloudWatchLogsConfig:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt PaymentApiGatewayRole.Arn
+
+##########################################################################
+#   Roles                                                                #
+##########################################################################
+
+  PaymentApiGatewayRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyName: CallStepFunctions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource:
+                  - !Ref ProcessPaymentStateMachine
+        - PolicyName: CallCreatePairingFunction
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt CreatePairingFunction.Arn
+
+  ProcessPaymentStateMachineRole:
+      Type: AWS::IAM::Role
+      Properties:
+          AssumeRolePolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                  - Effect: Allow
+                    Principal:
+                        Service: states.amazonaws.com
+                    Action: sts:AssumeRole
+          Path: /
+          Policies:
+            - PolicyName: StatesExecutionPolicy
+              PolicyDocument:
+                  Version: 2012-10-17
+                  Statement:
+                      - Effect: Allow
+                        Action:
+                            - lambda:InvokeFunction
+                        Resource:
+                            - !Sub ${PurchaseFunction.Arn}
+                            - !Sub ${StatusFunction.Arn}
+                      - Effect: Allow
+                        Action:
+                          - sns:Publish
+                        Resource:
+                          - !Ref TransactionStatusTopic
+
+##########################################################################
+#   Log Groups                                                           #
+##########################################################################
+
+  PaymentsApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/SwipeLess-Payments-Api-${PaymentsApi}-${Stage}
+      RetentionInDays: !Ref LogRetentionInDays
+
+  StatusFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/lambda/${StatusFunction}"
+          RetentionInDays: !Ref LogRetentionInDays
+
+  PurchaseFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/lambda/${PurchaseFunction}"
+          RetentionInDays: !Ref LogRetentionInDays
+
+  CreatePairingFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/lambda/${CreatePairingFunction}"
+          RetentionInDays: !Ref LogRetentionInDays
+
+  OnConnectFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/lambda/${OnConnectFunction}"
+          RetentionInDays: !Ref LogRetentionInDays
+
+  OnDisconnectFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/lambda/${OnDisconnectFunction}"
+          RetentionInDays: !Ref LogRetentionInDays
+
+  OnTerminalEventFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/lambda/${OnTerminalEventFunction}"
+          RetentionInDays: !Ref LogRetentionInDays
+
+  PinpointKinesisFirehoseLogGroup: # TODO fix me
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub "/aws/firehose/PinpointKinesisFirehose"
+          RetentionInDays: !Ref LogRetentionInDays
+
+##########################################################################
+#   Parameters                                                           #
+##########################################################################
+
+  PaymentEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/service/payment/api/url"
+      Type: String
+      Value: !Sub "https://${PaymentsApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+
+  PaymentWebsocketEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/service/payment/websocket/url"
+      Type: String
+      Value: !Sub "wss://${PaymentWebsocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+
+  WindcaveEndpointParameter:
+      Type: "AWS::SSM::Parameter"
+      Properties:
+          Name: !Sub /${Environment}/service/payment/windcave/endpoint
+          Type: String
+          Description: "Endpoint to Windcave's HIT API"
+          Value: !If [isEnvDev, 'https://uat.windcave.com/pxmi3/pos.aspx', 'https://sec.windcave.com/pxmi3/pos.aspx']
+
+##########################################################################
+#   Cognito                                                              #
+##########################################################################
+
+  UserPool:
+    Type: "AWS::Cognito::UserPool"
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-UserPool
+      DeviceConfiguration:
+         DeviceOnlyRememberedOnUserPrompt: true
+         ChallengeRequiredOnNewDevice: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly : False
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: True
+          RequireUppercase: True
+          RequireNumbers: True
+          RequireSymbols: False
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: given_name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: family_name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: swipeless-app
+      AnalyticsConfiguration:
+        RoleArn: !GetAtt CognitoUserPoolClientAnalyticsRole.Arn
+        ApplicationId: !Ref SwipelessPinpoint
+        ExternalId: "todo_external_id" # TODO what should this be?
+        UserDataShared: false
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - aws.cognito.signin.user.admin
+      CallbackURLs:
+        - 'https://example.com/callback'
+        - 'http://localhost:4200/token'
+      LogoutURLs:
+        - 'https://example.com/signout'
+        - 'http://localhost:4200/logout'
+      PreventUserExistenceErrors: 'ENABLED'
+
+  UserPoolCustomDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    DependsOn:
+      - 'RootHillBillyDevDomain'
+    Properties:
+      CustomDomainConfig:
+        CertificateArn: 'arn:aws:acm:us-east-1:118158469209:certificate/f7810137-3945-49ba-b928-68c6c7c99e24'
+      Domain: !Sub 'auth.${RootHillBillyDevDomain}'
+      UserPoolId: !Ref UserPool
+
+  RootHillBillyDevDomain:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: Z00550911XFW2R33KVNQR # TODO fix parameter on this.
+      Name: hillbillydev.com
+      ResourceRecords:
+      - 127.0.0.1
+      TTL: 300
+      Type: A
+
+  IdentityPool:
+    Type: "AWS::Cognito::IdentityPool"
+    Properties:
+      IdentityPoolName: Swipeless-Identity
+      AllowUnauthenticatedIdentities: true
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  CognitoUserPoolClientAnalyticsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "cognito-idp.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "CognitoUserPoolClientAnalytics"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobiletargeting:PutEvents"
+                  - "mobiletargeting:UpdateEndpoint"
+                Resource: !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${SwipelessPinpoint}/*" 
+
+  CognitoAuthorizedRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Federated: "cognito-identity.amazonaws.com"
+            Action: 
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals: 
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: "CognitoAuthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobiletargeting:PutEvents"
+                  - "mobiletargeting:UpdateEndpoint"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*" #TODO fix this to be a specific resource
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  CognitoUnAuthorizedRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Policies:
+        - PolicyName: "CognitoUnauthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action:
+                  - "mobiletargeting:PutEvents"
+                  - "mobiletargeting:UpdateEndpoint"
+                  - "cognito-sync:*"
+                Resource: "*" #TODO fix this to be a specific resource
+
+  IdentityPoolRoleMapping:
+    Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+        unauthenticated: !GetAtt CognitoUnAuthorizedRole.Arn
+
+##########################################################################
+#   Pinpoint                                                             #
+##########################################################################
+
+  SwipelessPinpoint:
+    Type: AWS::Pinpoint::App
+    Properties: 
+      Name: Swipeless-Pinpoint
+
+  SwipelessPinpointEventStream:
+    Type: AWS::Pinpoint::EventStream
+    Properties: 
+      ApplicationId: !Ref SwipelessPinpoint
+      DestinationStreamArn: !GetAtt PinpointKinesisFirehose.Arn
+      RoleArn: !GetAtt SwipelessPinpointRole.Arn
+
+  SwipelessPinpointRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: "pinpoint.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "SwipelessPinpointRole"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action:
+                  - "firehose:PutRecordBatch"
+                  - "firehose:DescribeDeliveryStream"
+                Resource: !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${PinpointKinesisFirehose}"
+
+##########################################################################
+#   Firehose                                                             #
+##########################################################################
+
+  PinpointKinesisFirehoseToS3BucketRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: "firehose.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "PinpointKinesisFirehoseToS3BucketRole"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                Resource: 
+                  -  !Sub "arn:aws:s3:::${SwipelessAnalyticsBucket}/*"
+                  -  !Sub "arn:aws:s3:::${SwipelessAnalyticsBucket}"
+
+  PinpointKinesisFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: swipeless-click-stream
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt SwipelessAnalyticsBucket.Arn
+        RoleARN: !GetAtt PinpointKinesisFirehoseToS3BucketRole.Arn
+        # CloudWatchLoggingOptions:
+        #   Enabled: true
+        #   LogGroupName: !Ref PinpointKinesisFirehoseLogGroup
+        #   LogStreamName: "testing"
+        # DataFormatConversionConfiguration:
+        #   Enabled: true
+        CompressionFormat: GZIP
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      CertificateTransparencyLoggingPreference: ENABLED
+      DomainName: "*.hillbillydev.com"
+      DomainValidationOptions:
+      - DomainName: www.hillbillydev.com
+        HostedZoneId: Z00550911XFW2R33KVNQR # TODO fix parameter on this.
+      ValidationMethod: DNS
+
+  SwipelessAnalyticsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: swipeless-analytics-bucket
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          -  ServerSideEncryptionByDefault:
+               SSEAlgorithm: AES256
+
+Outputs:
+  BaseUrl:
+    Description: "API Gateway endpoint URL for Transaction API"
+    Value: !Sub "https://${PaymentsApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  PaymentWebsocketAPIUrl:
+    Description: "Payment Web Socket Api Url"
+    Value: !Sub "wss://${PaymentWebsocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  TransactionStatusTopic:
+    Description: "TransactionStatus SNS Topic ARN"
+    Value: !Ref TransactionStatusTopic
